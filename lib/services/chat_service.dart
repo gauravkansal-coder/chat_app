@@ -26,6 +26,7 @@ class ChatService {
       'receiverID': receiverID,
       'message': message,
       'timestamp': timestamp,
+      'isRead': false,
     };
 
     List<String> ids = [currentUserID, receiverID];
@@ -51,5 +52,35 @@ class ChatService {
         .collection("messages")
         .orderBy("timestamp", descending: false)
         .snapshots();
+  }
+
+  // 4. MARK MESSAGES AS READ
+  Future<void> markMessagesAsRead(String receiverID) async {
+    final String currentUserID = _auth.currentUser!.uid;
+
+    // Calculate ChatRoomID (Same logic as above)
+    List<String> ids = [currentUserID, receiverID];
+    ids.sort();
+    String chatRoomID = ids.join('_');
+
+    // Query: Find messages in this chat sent by the OTHER person (senderID != me)
+    // that are currently NOT read.
+    final unreadMessagesQuery = _firestore
+        .collection("chat_rooms")
+        .doc(chatRoomID)
+        .collection("messages")
+        .where('senderID', isNotEqualTo: currentUserID)
+        .where('isRead', isEqualTo: false);
+
+    final snapshot = await unreadMessagesQuery.get();
+
+    // Batch Update: Update all found documents at once
+    if (snapshot.docs.isNotEmpty) {
+      WriteBatch batch = _firestore.batch();
+      for (var doc in snapshot.docs) {
+        batch.update(doc.reference, {'isRead': true});
+      }
+      await batch.commit();
+    }
   }
 }

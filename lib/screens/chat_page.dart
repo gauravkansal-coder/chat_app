@@ -1,11 +1,9 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import '../services/chat_service.dart';
 
 class ChatPage extends StatefulWidget {
-  // Make these OPTIONAL (nullable).
-  // If they are null -> We use Group Chat mode.
-  // If they have data -> We use Private Chat mode.
   final String? receiverEmail;
   final String? receiverID;
 
@@ -17,8 +15,10 @@ class ChatPage extends StatefulWidget {
 
 class _ChatPageState extends State<ChatPage> {
   final TextEditingController _messageController = TextEditingController();
-  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  final ChatService _chatService = ChatService();
   final FirebaseAuth _auth = FirebaseAuth.instance;
+
   final ScrollController _scrollController = ScrollController();
   FocusNode myFocusNode = FocusNode();
 
@@ -49,55 +49,36 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  // --- HELPER: GET THE CORRECT COLLECTION ---
-  // This is the magic part. It decides where to save/read messages.
-  CollectionReference getMessageCollection() {
-    // 1. GROUP CHAT MODE (No receiver)
-    if (widget.receiverID == null) {
-      return _firestore.collection('messages');
-    }
-
-    // 2. PRIVATE CHAT MODE (With receiver)
-    // Create a unique Chat Room ID that is always the same for these two users
-    String currentUserID = _auth.currentUser!.uid;
-    List<String> ids = [currentUserID, widget.receiverID!];
-    ids.sort(); // Sort alphabetically (e.g., "A_B" is same as "B_A")
-    String chatRoomID = ids.join('_');
-
-    return _firestore
-        .collection('chat_rooms')
-        .doc(chatRoomID)
-        .collection('messages');
-  }
-
-  // --- SEND MESSAGE ---
+  // SEND MESSAGE
   void sendMessage() async {
     if (_messageController.text.isNotEmpty) {
-      String message = _messageController.text;
+      // CHECK: Is this a Group Chat (null ID) or Private Chat?
+      if (widget.receiverID == null) {
+        // --- GROUP CHAT SEND ---
+        await FirebaseFirestore.instance.collection('messages').add({
+          'senderID': _auth.currentUser!.uid,
+          'senderEmail': _auth.currentUser!.email,
+          'message': _messageController.text,
+          'timestamp': Timestamp.now(),
+        });
+      } else {
+        // --- PRIVATE CHAT SEND ---
+        await _chatService.sendMessage(
+          widget.receiverID!,
+          _messageController.text,
+        );
+      }
+
       _messageController.clear();
-
-      // --- BUG FIX ---
-      // use getMessageCollection() to ensure it goes to the right room
-      await getMessageCollection().add({
-        'text': message,
-        'sender': _auth.currentUser!.email,
-        'senderID': _auth.currentUser!.uid,
-        'timestamp': FieldValue.serverTimestamp(),
-        'readBy': [],
-      });
-
       scrollDown();
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    // Determine the title based on mode
-    String pageTitle = widget.receiverEmail ?? "Team Chat";
-
     return Scaffold(
       appBar: AppBar(
-        title: Text(pageTitle),
+        title: Text(widget.receiverEmail ?? "Team Chat"), // Fallback title
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.grey,
         elevation: 0,
@@ -112,15 +93,34 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   Widget _buildMessageList() {
-    return StreamBuilder<QuerySnapshot>(
-      // Listen to the correct collection dynamically
-      stream: getMessageCollection()
+    String currentUserID = _auth.currentUser!.uid;
+
+    // DETERMINE THE STREAM SOURCE
+    Stream<QuerySnapshot> stream;
+    if (widget.receiverID == null) {
+      // Group Chat Stream
+      stream = FirebaseFirestore.instance
+          .collection('messages')
           .orderBy('timestamp', descending: false)
-          .snapshots(),
+          .snapshots();
+    } else {
+      // Private Chat Stream
+      stream = _chatService.getMessages(widget.receiverID!, currentUserID);
+    }
+
+    return StreamBuilder<QuerySnapshot>(
+      stream: stream,
       builder: (context, snapshot) {
         if (snapshot.hasError) return const Text('Error');
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(child: CircularProgressIndicator());
+        }
+
+        // TRIGGER READ RECEIPT (Only for Private Chat)
+        if (snapshot.hasData && widget.receiverID != null) {
+          Future.microtask(
+            () => _chatService.markMessagesAsRead(widget.receiverID!),
+          );
         }
 
         return ListView(
@@ -136,33 +136,42 @@ class _ChatPageState extends State<ChatPage> {
   Widget _buildMessageItem(DocumentSnapshot document) {
     Map<String, dynamic> data = document.data() as Map<String, dynamic>;
 
-    String messageText = data['text'] ?? '';
-    String senderEmail = data['sender'] ?? 'Unknown';
-    List<dynamic> readBy = data['readBy'] ?? [];
-    bool isRead = readBy.isNotEmpty; // Simplified read check
+    // Align content
+    bool isCurrentUser = data['senderID'] == _auth.currentUser!.uid;
+    var alignment = isCurrentUser
+        ? Alignment.centerRight
+        : Alignment.centerLeft;
 
-    // Timestamp
+    // Timestamp formatting
     Timestamp? t = data['timestamp'];
     DateTime d = t != null ? t.toDate() : DateTime.now();
     String formattedTime = "${d.hour}:${d.minute.toString().padLeft(2, '0')}";
 
-    bool isCurrentUser = senderEmail == _auth.currentUser?.email;
+    // Check Read Status
+    bool isRead = data['isRead'] ?? false;
+
+    // Handle old keys ('text') vs new keys ('message')
+    String messageContent = data['message'] ?? data['text'] ?? "";
+    String senderEmail = data['senderEmail'] ?? data['sender'] ?? "Unknown";
 
     return Container(
-      alignment: isCurrentUser ? Alignment.centerRight : Alignment.centerLeft,
+      alignment: alignment,
       padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
       child: Column(
         crossAxisAlignment: isCurrentUser
             ? CrossAxisAlignment.end
             : CrossAxisAlignment.start,
         children: [
-          if (!isCurrentUser) // Only show name for others
-            Text(
-              senderEmail,
-              style: const TextStyle(fontSize: 10, color: Colors.grey),
+          // Show Name in Group Chat (if not me)
+          if (!isCurrentUser && widget.receiverID == null)
+            Padding(
+              padding: const EdgeInsets.only(left: 5.0, bottom: 2.0),
+              child: Text(
+                senderEmail,
+                style: TextStyle(fontSize: 10, color: Colors.grey),
+              ),
             ),
 
-          const SizedBox(height: 2),
           Container(
             padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
@@ -174,7 +183,7 @@ class _ChatPageState extends State<ChatPage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  messageText,
+                  messageContent,
                   style: TextStyle(
                     color: isCurrentUser ? Colors.white : Colors.black,
                     fontSize: 16,
@@ -191,13 +200,17 @@ class _ChatPageState extends State<ChatPage> {
                         color: isCurrentUser ? Colors.white70 : Colors.black54,
                       ),
                     ),
-                    const SizedBox(width: 5),
-                    if (isCurrentUser)
+                    // Show Blue Ticks ONLY for Private Chat & Current User
+                    if (isCurrentUser && widget.receiverID != null) ...[
+                      const SizedBox(width: 5),
                       Icon(
                         Icons.done_all,
                         size: 15,
-                        color: isRead ? Colors.blue.shade900 : Colors.white60,
+                        color: isRead
+                            ? const Color.fromARGB(255, 12, 59, 141)
+                            : Colors.white60,
                       ),
+                    ],
                   ],
                 ),
               ],
